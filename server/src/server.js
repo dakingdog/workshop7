@@ -1,5 +1,7 @@
 // Imports the express Node module.
 var express = require('express');
+var mongo_express=require('mongo-express/lib/middleware');
+var mongo_express_config=require('mongo-express/config.default.js');
 // Creates an Express server.
 var app = express();
 // Parses response bodies.
@@ -17,6 +19,7 @@ var validate = require('express-jsonschema').validate;
 app.use(bodyParser.text());
 app.use(bodyParser.json());
 app.use(express.static('../client/build'));
+app.use('/mongo_express', mongo_express(mongo_express_config));
 
 /**
  * Resolves a feed item. Internal to the server, since it's synchronous.

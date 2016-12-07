@@ -4,29 +4,36 @@ MongoClient.connect(url, function (err, db) {
   if (err) {
     throw new Error("Could not connect to database: " + err);
   } else {
-    console.log("connected correctly to server.")
+    console.log("connected correctly to server.");
     mongoExample(db);
   }
 })
 /**
-	Description:
-*Insert simple document into helloworld document collection. 
-*@param db database collection
-*@callback - callback function.
-**/
+ * Inserts a simple document into the 'helloworld'
+ * document collection.
+ * @param db The database connection
+ * @param callback A callback function to call once the
+ *   operation completes. We will pass back the new object's
+ *   ID.
+ */
 function insertExample(db, callback) {
+  // A document is just a JSON object, like in our mock database.
   var exampleDocument = {
-    message: "Hello, World!"
+    message: "Hello, world!"
   };
+  // Insert the example document into collection 'helloworld'.
   db.collection('helloworld').insertOne(exampleDocument, function(err, result) {
     if (err) {
+      // Something bad happened, and the insertion failed.
       throw err;
     } else {
-      console.log("Successfully updated database, new object ID is " + result.insertedId);
+      // Success!
+      console.log("Successfully updated database! The new object's ID is " + result.insertedId);
       callback(result.insertedId);
     }
   });
 }
+
 /**
  * Get a document from the helloworld document collection with
  * a particular _id.
