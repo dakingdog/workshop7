@@ -1,6 +1,7 @@
 // Imports the express Node module.
 var express = require('express');
 //mongodb setup
+var ResetDatabase=require('./resetdatabase');
 var mongo_express = require('mongo-express/lib/middleware');
 var mongo_express_config = require('mongo-express/config.default.js');
 var MongoDB = require('mongodb');
@@ -199,19 +200,19 @@ MongoClient.connect(url, function(err, db) {
     var fromUser = getUserIdFromToken(req.get('Authorization'));
     if (fromUser === userid) {
       // Send response.
-       getFeedData(new ObjectID(userid), function(err, feedData) {
-      if (err) {
-        // A database error happened.
-        // Internal Error: 500.
-        res.status(500).send("Database error: " + err);
-      } else if (feedData === null) {
-        // Couldn't find the feed in the database.
-        res.status(400).send("Could not look up feed for user " + userid);
-      } else {
-        // Send data.
-        res.send(feedData);
-      }
-    });
+      getFeedData(new ObjectID(userid), function(err, feedData) {
+        if (err) {
+          // A database error happened.
+          // Internal Error: 500.
+          res.status(500).send("Database error: " + err);
+        } else if (feedData === null) {
+          // Couldn't find the feed in the database.
+          res.status(400).send("Could not look up feed for user " + userid);
+        } else {
+          // Send data.
+          res.send(feedData);
+        }
+      });
     } else {
       // 403: Unauthorized request.
       res.status(403).end();
@@ -221,11 +222,11 @@ MongoClient.connect(url, function(err, db) {
   /**
    * Adds a new status update to the database.
    */
-  function postStatusUpdate(user, location, contents, image) {
-    // If we were implementing this for real on an actual server, we would check
-    // that the user ID is correct & matches the authenticated user. But since
-    // we're mocking it, we can be less strict.
-
+  /**
+ * Adds a new status update to the database.
+ * @param user ObjectID of the user.
+ */
+  function postStatusUpdate(user, location, contents, image, callback) {
     // Get the current UNIX time.
     var time = new Date().getTime();
     // The new status update. The database will assign the ID for us.
@@ -237,27 +238,53 @@ MongoClient.connect(url, function(err, db) {
         "postDate": time,
         "location": location,
         "contents": contents,
-        "image": image,
-        "likeCounter": []
+        "image": image
       },
       // List of comments on the post
       "comments": []
     };
 
     // Add the status update to the database.
-    // Returns the status update w/ an ID assigned.
-    newStatusUpdate = addDocument('feedItems', newStatusUpdate);
+    db.collection('feedItems').insertOne(newStatusUpdate, function(err, result) {
+      if (err) {
+        return callback(err);
+      }
+      // Unlike the mock database, MongoDB does not return the newly added object
+      // with the _id set.
+      // Attach the new feed item's ID to the newStatusUpdate object. We will
+      // return this object to the client when we are done.
+      // (When performing an insert operation, result.insertedId contains the new
+      // document's ID.)
+      newStatusUpdate._id = result.insertedId;
 
-    // Add the status update reference to the front of the current user's feed.
-    var userData = readDocument('users', user);
-    var feedData = readDocument('feeds', userData.feed);
-    feedData.contents.unshift(newStatusUpdate._id);
-
-    // Update the feed object.
-    writeDocument('feeds', feedData);
-
-    // Return the newly-posted object.
-    return newStatusUpdate;
+      // Retrieve the author's user object.
+      db.collection('users').findOne({
+        _id: user
+      }, function(err, userObject) {
+        if (err) {
+          return callback(err);
+        }
+        // Update the author's feed with the new status update's ID.
+        db.collection('feeds').updateOne({
+          _id: userObject.feed
+        },
+          {
+            $push: {
+              contents: {
+                $each: [newStatusUpdate._id],
+                $position: 0
+              }
+            }
+          }, function(err) {
+            if (err) {
+              return callback(err);
+            }
+            // Return the new status update to the application.
+            callback(null, newStatusUpdate);
+          }
+        );
+      });
+    });
   }
 
   //`POST /feeditem { userId: user, location: location, contents: contents  }`
@@ -271,143 +298,233 @@ MongoClient.connect(url, function(err, db) {
     // Check if requester is authorized to post this status update.
     // (The requester must be the author of the update.)
     if (fromUser === body.userId) {
-      var newUpdate = postStatusUpdate(body.userId, body.location, body.contents, body.image);
-      // When POST creates a new resource, we should tell the client about it
-      // in the 'Location' header and use status code 201.
-      res.status(201);
-      res.set('Location', '/feeditem/' + newUpdate._id);
-      // Send the update!
-      res.send(newUpdate);
+      postStatusUpdate(new ObjectID(fromUser), body.location, body.contents, body.image, function(err, newUpdate) {
+        if (err) {
+          // A database error happened.
+          // 500: Internal error.
+          res.status(500).send("A database error occurred: " + err);
+        } else {
+          // When POST creates a new resource, we should tell the client about it
+          // in the 'Location' header and use status code 201.
+          res.status(201);
+          res.set('Location', '/feeditem/' + newUpdate._id);
+          // Send the update!
+          res.send(newUpdate);
+        }
+      });
     } else {
       // 401: Unauthorized.
       res.status(401).end();
     }
   });
+  function sendDatabaseError(res, err) {
+    res.status(500).send("A database error occurred: " + err);
+  }
 
   // `PUT /feeditem/feedItemId/likelist/userId` content
   app.put('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
     var fromUser = getUserIdFromToken(req.get('Authorization'));
-    // Convert params from string to number.
-    var feedItemId = parseInt(req.params.feeditemid, 10);
-    var userId = parseInt(req.params.userid, 10);
+    var feedItemId = new ObjectID(req.params.feeditemid);
+    var userId = req.params.userid;
     if (fromUser === userId) {
-      var feedItem = readDocument('feedItems', feedItemId);
-      // Add to likeCounter if not already present.
-      if (feedItem.likeCounter.indexOf(userId) === -1) {
-        feedItem.likeCounter.push(userId);
-        writeDocument('feedItems', feedItem);
-      }
-      // Return a resolved version of the likeCounter
-      res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
+      // First, we can update the like counter.
+      db.collection('feedItems').updateOne({
+        _id: feedItemId
+      },
+        {
+          // Add `userId` to the likeCounter if it is not already
+          // in the array.
+          $addToSet: {
+            likeCounter: new ObjectID(userId)
+          }
+        }, function(err) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Second, grab the feed item now that we have updated it.
+          db.collection('feedItems').findOne({
+            _id: feedItemId
+          }, function(err, feedItem) {
+            if (err) {
+              return sendDatabaseError(res, err);
+            }
+            // Return a resolved version of the likeCounter
+            resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+              if (err) {
+                return sendDatabaseError(res, err);
+              }
+              // Return a resolved version of the likeCounter
+              res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+            });
+          }
+          );
+        });
     } else {
       // 401: Unauthorized.
       res.status(401).end();
     }
   });
-
   // Unlike a feed item.
-  app.delete('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
-    var fromUser = getUserIdFromToken(req.get('Authorization'));
-    // Convert params from string to number.
-    var feedItemId = parseInt(req.params.feeditemid, 10);
-    var userId = parseInt(req.params.userid, 10);
-    if (fromUser === userId) {
-      var feedItem = readDocument('feedItems', feedItemId);
-      var likeIndex = feedItem.likeCounter.indexOf(userId);
-      // Remove from likeCounter if present
-      if (likeIndex !== -1) {
-        feedItem.likeCounter.splice(likeIndex, 1);
-        writeDocument('feedItems', feedItem);
+  // Unlike a feed item.
+app.delete('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  var feedItemId = new ObjectID(req.params.feeditemid);
+  var userId = req.params.userid;
+  if (fromUser === userId) {
+    // Step 1: Remove userId from the likeCounter.
+    db.collection('feedItems').updateOne({ _id: feedItemId },
+      {
+        // Only removes the userId from the likeCounter, if it is in the likeCounter.
+        $pull: {
+          likeCounter: new ObjectID(userId)
+        }
+      }, function(err) {
+      if (err) {
+        return sendDatabaseError(res, err);
       }
-      // Return a resolved version of the likeCounter
-      res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
-    } else {
-      // 401: Unauthorized.
-      res.status(401).end();
-    }
-  });
+      // Step 2: Get the feed item.
+      db.collection('feedItems').findOne({ _id: feedItemId }, function(err, feedItem) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        // Step 3: Resolve the user IDs in the like counter into user objects.
+        resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Return a resolved version of the likeCounter
+          res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+        });
+      });
+    });
+  } else {
+    // 401: Unauthorized.
+    res.status(401).end();
+  }
+});
 
   // `PUT /feeditem/feedItemId/content newContent`
+  // `PUT /feeditem/feedItemId/content newContent`
   app.put('/feeditem/:feeditemid/content', function(req, res) {
-    var fromUser = getUserIdFromToken(req.get('Authorization'));
-    var feedItemId = req.params.feeditemid;
-    var feedItem = readDocument('feedItems', feedItemId);
-    // Check that the requester is the author of this feed item.
-    if (fromUser === feedItem.contents.author) {
-      // Check that the body is a string, and not something like a JSON object.
-      // We can't use JSON validation here, since the body is simply text!
-      if (typeof (req.body) !== 'string') {
-        // 400: Bad request.
-        res.status(400).end();
-        return;
+    var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
+    var feedItemId = new ObjectID(req.params.feeditemid);
+
+    // Only update the feed item if the author matches the currently authenticated
+    // user.
+    db.collection('feedItems').updateOne({
+      _id: feedItemId,
+      // This is how you specify nested fields on the document.
+      "contents.author": fromUser
+    }, {
+      $set: {
+        "contents.contents": req.body
       }
-      // Update text content of update.
-      feedItem.contents.contents = req.body;
-      writeDocument('feedItems', feedItem);
-      res.send(getFeedItemSync(feedItemId));
-    } else {
-      // 401: Unauthorized.
-      res.status(401).end();
-    }
+    }, function(err, result) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      } else if (result.modifiedCount === 0) {
+        // Could not find the specified feed item. Perhaps it does not exist, or
+        // is not authored by the user.
+        // 400: Bad request.
+        return res.status(400).end();
+      }
+
+      // Update succeeded! Return the resolved feed item.
+      getFeedItem(feedItemId, function(err, feedItem) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        res.send(feedItem);
+      });
+    });
   });
 
   // `DELETE /feeditem/:id`
-  app.delete('/feeditem/:feeditemid', function(req, res) {
+  // Unlike a feed item.
+  app.delete('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
     var fromUser = getUserIdFromToken(req.get('Authorization'));
-    // Convert from a string into a number.
-    var feedItemId = parseInt(req.params.feeditemid, 10);
-    var feedItem = readDocument('feedItems', feedItemId);
-    // Check that the author of the post is requesting the delete.
-    if (feedItem.contents.author === fromUser) {
-      deleteDocument('feedItems', feedItemId);
-      // Remove references to this feed item from all other feeds.
-      var feeds = getCollection('feeds');
-      var feedIds = Object.keys(feeds);
-      feedIds.forEach((feedId) => {
-        var feed = feeds[feedId];
-        var itemIdx = feed.contents.indexOf(feedItemId);
-        if (itemIdx !== -1) {
-          // Splice out of array.
-          feed.contents.splice(itemIdx, 1);
-          // Update feed.
-          database.writeDocument('feeds', feed);
-        }
-      });
-      // Send a blank response to indicate success.
-      res.send();
+    var feedItemId = new ObjectID(req.params.feeditemid);
+    var userId = req.params.userid;
+    if (fromUser === userId) {
+      // Step 1: Remove userId from the likeCounter.
+      db.collection('feedItems').updateOne({
+        _id: feedItemId
+      },
+        {
+          // Only removes the userId from the likeCounter, if it is in the likeCounter.
+          $pull: {
+            likeCounter: new ObjectID(userId)
+          }
+        }, function(err) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Step 2: Get the feed item.
+          db.collection('feedItems').findOne({
+            _id: feedItemId
+          }, function(err, feedItem) {
+            if (err) {
+              return sendDatabaseError(res, err);
+            }
+            // Step 3: Resolve the user IDs in the like counter into user objects.
+            resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+              if (err) {
+                return sendDatabaseError(res, err);
+              }
+              // Return a resolved version of the likeCounter
+              res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+            });
+          });
+        });
     } else {
       // 401: Unauthorized.
       res.status(401).end();
     }
   });
-
   //`POST /search queryText`
-  app.post('/search', function(req, res) {
-    var fromUser = getUserIdFromToken(req.get('Authorization'));
-    var user = readDocument('users', fromUser);
-    if (typeof (req.body) === 'string') {
-      // trim() removes whitespace before and after the query.
-      // toLowerCase() makes the query lowercase.
-      var queryText = req.body.trim().toLowerCase();
-      // Search the user's feed.
-      var feedItemIDs = readDocument('feeds', user.feed).contents;
-      // "filter" is like "map" in that it is a magic method for
-      // arrays. It takes an anonymous function, which it calls
-      // with each item in the array. If that function returns 'true',
-      // it will include the item in a return array. Otherwise, it will
-      // not.
-      // Here, we use filter to return only feedItems that contain the
-      // query text.
-      // Since the array contains feed item IDs, we later map the filtered
-      // IDs to actual feed item objects.
-      res.send(feedItemIDs.filter((feedItemID) => {
-        var feedItem = readDocument('feedItems', feedItemID);
-        return feedItem.contents.contents.toLowerCase().indexOf(queryText) !== -1;
-      }).map(getFeedItemSync));
-    } else {
-      // 400: Bad Request.
-      res.status(400).end();
-    }
+  // `DELETE /feeditem/:id`
+  app.delete('/feeditem/:feeditemid', function(req, res) {
+    var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
+    var feedItemId = new ObjectID(req.params.feeditemid);
+
+    // Check if authenticated user has access to delete the feed item.
+    db.collection('feedItems').findOne({
+      _id: feedItemId,
+      "contents.author": fromUser
+    }, function(err, feedItem) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      } else if (feedItem === null) {
+        // Could not find the specified feed item. Perhaps it does not exist, or
+        // is not authored by the user.
+        // 400: Bad request.
+        return res.status(400).end();
+      }
+
+      // User authored the feed item!
+      // Remove feed item from all feeds using $pull and a blank filter.
+      // A blank filter matches every document in the collection.
+      db.collection('feeds').updateMany({}, {
+        $pull: {
+          contents: feedItemId
+        }
+      }, function(err) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+
+        // Finally, remove the feed item.
+        db.collection('feedItems').deleteOne({
+          _id: feedItemId
+        }, function(err) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Send a blank response to indicate success.
+          res.send();
+        });
+      });
+    });
   });
 
   // Post a comment
@@ -484,11 +601,12 @@ MongoClient.connect(url, function(err, db) {
   });
 
   // Reset database.
+  // Reset the database.
   app.post('/resetdb', function(req, res) {
     console.log("Resetting database...");
-    // This is a debug route, so don't do any validation.
-    database.resetDatabase();
-    res.send();
+    ResetDatabase(db, function() {
+      res.send();
+    });
   });
 
   /**
