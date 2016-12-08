@@ -68,7 +68,7 @@ function sendXHR(verb, resource, body, cb) {
  * Emulates a REST call to get the feed data for a particular user.
  */
 export function getFeedData(user, cb) {
-  sendXHR('GET', '/user/4/feed', undefined, (xhr) => {
+  sendXHR('GET', '/user/"000000000000000000000004"/feed', undefined, (xhr) => {//TODO: change route
     // Call the callback with the data.
     cb(JSON.parse(xhr.responseText));
   });

@@ -27,7 +27,7 @@ class ProfilePage extends React.Component {
  */
 class FeedPage extends React.Component {
   render() {
-    return <Feed user={4} />;
+    return <Feed user={"000000000000000000000004"} />;
   }
 }
 

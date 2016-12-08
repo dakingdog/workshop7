@@ -4,7 +4,7 @@ import {Link} from 'react-router';
 
 export default class Comment extends React.Component {
   didUserLike() {
-    return this.props.likeCounter.indexOf(4) !== -1;
+    return this.props.likeCounter.indexOf("000000000000000000000004") !== -1;
   }
   
   handleLikeClick(e) {
